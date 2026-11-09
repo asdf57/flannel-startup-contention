@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+# flannel-startup-hold: keep kube-proxy off the xtables lock until Flannel has written its rules.
+#
+# On iptables-legacy nodes with many Services, kube-proxy's first full restore can land before Flannel programs its
+# few rules; every Flannel command then rewrites a huge NAT table behind a long lock queue. This briefly freezes
+# kube-proxy's cgroup (at most MAX_HOLD_SECONDS, never while one of its iptables commands runs) until Flannel writes
+# /run/flannel/subnet.env, then thaws it. It kills nothing.
+#
+# Requires Flannel (and Multus, if used) to reach the API directly: set KUBERNETES_SERVICE_HOST/PORT to the API
+# endpoint on their DaemonSets. Otherwise Flannel needs kube-proxy's ClusterIP rule and holding kube-proxy stalls it.
+# Run after kubelet; the systemd unit calls it with --thaw on stop (ExecStopPost) so kube-proxy can never stay frozen.
+
+set -u
+
+readonly READY=/run/flannel/subnet.env     # written by Flannel once its rules are in place
+readonly MAX_HOLD_SECONDS=120              # never keep kube-proxy frozen longer than this
+readonly DEADLINE_SECONDS=600              # give up waiting for Flannel after this
+readonly DONE_MARKER=/run/flannel-startup-hold.done
+
+log() { logger -t kube-flannel-startup "$*"; }
+
+if [[ -f /sys/fs/cgroup/cgroup.controllers ]]; then FZ_FILE=cgroup.freeze FZ_ON=1 FZ_OFF=0
+else FZ_FILE=freezer.state FZ_ON=FROZEN FZ_OFF=THAWED; fi
+
+cgroup_of() {
+    awk -F: -v f="$FZ_FILE" '(f == "cgroup.freeze" && $1 == 0) { print "/sys/fs/cgroup" $3 }
+        (f == "freezer.state" && $2 ~ /(^|,)freezer(,|$)/) { print "/sys/fs/cgroup/freezer" $3 }' "/proc/$1/cgroup"
+}
+
+thaw_kube_proxy() {
+    local pid
+    for pid in $(pgrep -x kube-proxy); do echo "$FZ_OFF" > "$(cgroup_of "$pid")/$FZ_FILE" 2>/dev/null; done
+    return 0
+}
+
+# ExecStopPost: only thaw.
+if [[ "${1:-}" == --thaw ]]; then thaw_kube_proxy; exit 0; fi
+
+# Once per boot.
+( set -o noclobber; : > "$DONE_MARKER" ) 2>/dev/null || exit 0
+
+trap 'thaw_kube_proxy' EXIT
+trap 'exit 0' TERM INT
+
+held_at=0
+while (( SECONDS < DEADLINE_SECONDS )) && [[ ! -s "$READY" ]]; do
+    if (( held_at == 0 )) && pid=$(pgrep -xo kube-proxy); then
+        cg=$(cgroup_of "$pid")
+        echo "$FZ_ON" > "$cg/$FZ_FILE" 2>/dev/null || { log "cannot freeze kube-proxy ($cg); not holding"; break; }
+        # Never leave kube-proxy frozen while one of its iptables commands holds the lock.
+        if xargs -r -a "$cg/cgroup.procs" ps -o comm= -p 2>/dev/null | grep -q '^ip6\?tables'; then
+            echo "$FZ_OFF" > "$cg/$FZ_FILE"; sleep 0.5; continue
+        fi
+        held_at=$SECONDS
+        log "kube-proxy held at ${SECONDS}s until Flannel is ready (max ${MAX_HOLD_SECONDS}s)"
+    fi
+    (( held_at > 0 && SECONDS - held_at >= MAX_HOLD_SECONDS )) && break
+    sleep 0.2
+done
+
+thaw_kube_proxy
+if [[ -s "$READY" ]]; then log "Flannel ready after ${SECONDS}s; kube-proxy released"
+else log "Flannel not ready after ${SECONDS}s; kube-proxy released"; fi

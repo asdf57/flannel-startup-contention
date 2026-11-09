@@ -1,0 +1,15 @@
+[Unit]
+Description=Keep kube-proxy off the xtables lock until Flannel is ready
+After=kubelet.service
+Wants=kubelet.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/flannel-startup-hold
+# Runs even if the script is killed, so kube-proxy can never stay frozen.
+ExecStopPost=/usr/local/sbin/flannel-startup-hold --thaw
+# Above the script's own 600 s deadline; if anything hangs, systemd stops it and ExecStopPost thaws kube-proxy.
+RuntimeMaxSec=900
+
+[Install]
+WantedBy=multi-user.target
