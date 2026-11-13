@@ -80,12 +80,27 @@ all pods Running, seconds after the reboot.
 | script, 80 hostPort pods | up in 74-102 s |
 | script, 80 hostPort pods, 128 busy CPU loops + 200 lock-hammer loops | up in 90-146 s |
 | script, 80 hostPort pods, Flannel 4 min late | up in 283-305 s |
-| script, all of the above at once, Flannel 400 s late | up in 453 s |
+| script, all of the above at once, Flannel 4 min / 400 s late | up in 305 s / 453 s |
 
 In every run with the script in control: 0 CNI iptables commands before Flannel was ready, and no kube-proxy
-process frozen while holding the lock (hundreds of stress cycles). The node also came up after `kill -9`,
-restart, kubelet/containerd restarts, a reboot or a hard crash during the hold. Known failures: Flannel later
-than the limit, or repeated `systemctl stop` under extreme lock contention, with many hostPort pods.
+process frozen while holding the lock (hundreds of stress cycles, also under 64 lock-hammer loops and 32 busy CPU
+loops). kube-proxy is thawed 20-60 s after Flannel is ready.
+
+Deliberate disruptions during the boot, each with the node coming up and nothing left frozen or mounted:
+
+| disruption | outcome |
+|---|---|
+| service killed (`kill -9`) | restarted in about 1 s, hold resumed |
+| `systemctl restart`, 8 rounds of stop / start / kill (8 hostPort pods) | hold resumed each time |
+| script deleted from disk, then service killed | timer thawed kube-proxy from the memory copy 30 s after the limit |
+| service killed or restarted, kube-proxy container removed, Flannel killed - right after Flannel was ready | up in 101-283 s |
+| frozen kube-proxy pod deleted or its container removed | replacement held within about a second |
+| Flannel killed three times before it was ready | up in 115 s |
+| kubelet restarted right after Flannel was ready | up in 110 s; the restart itself leaks `CNI-DN` chains |
+| containerd restarted, rogue lock holder for 200 s, reboot or hard crash during the hold | node came up |
+
+Runs that did not come up, all with 80 hostPort pods or extreme lock contention: Flannel later than the time limit;
+repeated `systemctl stop` during the first minutes (each stop releases kube-proxy, which then loads its table).
 
 ## Install
 
