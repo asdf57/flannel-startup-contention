@@ -1,6 +1,6 @@
 # flannel-startup-contention
 
-Getting Flannel up fast after a reboot on Kubernetes nodes that use **iptables-legacy** and carry **many
+Getting Flannel up first after a reboot on Kubernetes nodes that use **iptables-legacy** and carry **many
 Services**, plus a script to build that load in a test cluster.
 
 ## The problem
@@ -9,17 +9,15 @@ With tens of thousands of Services, kube-proxy (iptables mode, e.g. Kubernetes 1
 or hundreds of thousands of lines. iptables-legacy rewrites a whole table for every command under one global lock
 (`/run/xtables.lock`), so after a reboot:
 
-1. Flannel reaches the API through the `kubernetes` Service ClusterIP (client-go in-cluster config), which only
-   works once kube-proxy has programmed it. Flannel's first container times out after 30 s and crashes.
+1. Flannel reaches the API through the `kubernetes` Service ClusterIP, which only works once kube-proxy has
+   programmed it. Flannel's first container times out after 30 s and crashes.
 2. Once kube-proxy has loaded its big table, each of Flannel's iptables commands is slow and waits behind every
-   other command (kube-proxy's full restores, CNI `portmap` setup/teardown). Flannel can take many minutes.
-3. Killing lock holders to "make room" backfires: killing kube-proxy's restores keeps the ClusterIP unusable, and
-   killing `portmap` during CNI DEL fails teardowns (`failed to destroy network ... signal: killed`), leaving pods
-   stuck `Terminating` and leaking `CNI-DN-*` chains.
+   other command (kube-proxy's restores, CNI `portmap` setup/teardown for hostPort pods). Flannel can take many
+   minutes, and no pod can start without it.
+3. With many hostPort pods, their `portmap` calls on the full table exceed kubelet's 2-minute limit, never finish,
+   and leak `CNI-DN-*` chains.
 
 ## The fix
-
-Two parts:
 
 **1. Let Flannel (and Multus) reach the API directly.** On every container and init container of their
 DaemonSets:
@@ -32,26 +30,62 @@ env:
   value: "6443"
 ```
 
-**2. `flannel-startup-hold`:** a small boot script that freezes kube-proxy's cgroup until Flannel has written
-`/run/flannel/subnet.env`, so Flannel programs its rules while the NAT table is still small. It holds for at most
-120 s, never freezes kube-proxy while one of its iptables commands runs (it may hold the lock), always thaws on
-exit, and kills nothing. Works with cgroup v1 (`freezer.state`) and v2 (`cgroup.freeze`).
+Also pull the Flannel and pause images before kubelet starts, so Flannel is not waiting on a registry.
 
-Part 1 is required for part 2: without it Flannel needs kube-proxy's ClusterIP rule, and holding kube-proxy would
-stall Flannel instead.
+**2. `flannel-startup-hold`**, one script and one systemd unit on the node. Until Flannel has written
+`/run/flannel/subnet.env` (it does that after its rules are in), or a time limit has passed, it:
 
-### Results (lab: 3 nodes, Kubernetes 1.23, containerd 1.4, iptables-legacy, 25,000 Services, heavy contention)
+- **freezes kube-proxy** (cgroup v1 freezer) from the moment it starts, and
+- **gates the CNI `portmap` plugin**, the only CNI plugin here that runs iptables: teardown (DEL) succeeds at once,
+  setup (ADD) answers "try again later".
 
-Flannel ready, seconds after kubelet start, with part 1 in place:
+When Flannel is ready the gate is removed first, the pods' first CNI calls run on the still-small table, and
+kube-proxy is thawed once no `portmap` has run for 20 s (60 s at most). Nothing is killed.
 
-| boot | no script | flannel-startup-hold |
-|---|---|---|
-| Flannel starts first | 13, 25 | 39, 20 |
-| kube-proxy starts first | **243**, 32 | **32, 50** |
+### Safety properties
 
-Without part 2 the outcome depends on who wins the boot race; with it, Flannel was fast every time (kube-proxy held
-9-13 s when it started first). For comparison, a kill-based guard without part 1 took 211-238 s for Flannel and
-caused 100-600 failed CNI teardowns per boot.
+- **The xtables lock cannot be left stuck.** kube-proxy is frozen only while the script itself holds the lock, and
+  the lock is released only after the kernel reports the cgroup `FROZEN`; otherwise it is thawed again.
+- **Nothing is written to disk.** The gate is a shell stub in a tmpfs under `/run`, bind-mounted read-only over
+  `/opt/cni/bin/portmap`; the real plugin stays untouched underneath. A reboot always restores the node.
+- **The gate cannot break pod creation.** It is checked against the real plugin before and after mounting and is
+  removed at once if anything differs. It opens by itself when Flannel is ready or the time limit passes, even if
+  the script is gone.
+- **kube-proxy cannot stay frozen.** The script releases on any exit; the unit's `ExecStopPost` releases if it is
+  killed; a one-shot systemd timer, armed before anything is frozen and running a copy of the script kept in
+  memory, releases 30 s after the limit whatever happened.
+- **Stopping, killing or restarting the service is harmless.** A stop releases everything. A killed service is
+  restarted at once (`Restart=on-failure`) and takes the hold up again, until the same deadline the first start of
+  the boot set. The script holds only when started by systemd.
+- **Fail open.** After `FLANNEL_HOLD_MAX_SECONDS` (default 600) everything is released, Flannel ready or not.
+
+### Limits
+
+- Requires cgroup v1, kube-proxy as a pod, and kubelet/containerd in the host mount namespace.
+- While the service is stopped, and after the time limit, the node is unprotected.
+- Only `portmap` is gated; another CNI plugin that runs iptables would not be held.
+- Nothing may write `/opt/cni/bin/portmap` during boot (the gate is a read-only mount over it).
+- Without the env vars of part 1 the script still works (kube-proxy runs until the Service IP answers, then is
+  held), but Flannel then starts on the full table and nodes with many hostPort pods may not come up.
+
+### Lab results
+
+3 nodes, Kubernetes 1.23.4, containerd 1.4, iptables-legacy, cgroup v1, 25,000 Services, part 1 in place. "Up" =
+all pods Running, seconds after the reboot.
+
+| boot | result |
+|---|---|
+| no script, 80 hostPort pods, Flannel 4 min late | not up after 805 s; 10,625 CNI iptables commands before Flannel |
+| script, 2 hostPort pods | up in 87-115 s |
+| script, 80 hostPort pods | up in 74-102 s |
+| script, 80 hostPort pods, 128 busy CPU loops + 200 lock-hammer loops | up in 90-146 s |
+| script, 80 hostPort pods, Flannel 4 min late | up in 283-305 s |
+| script, all of the above at once, Flannel 400 s late | up in 453 s |
+
+In every run with the script in control: 0 CNI iptables commands before Flannel was ready, and no kube-proxy
+process frozen while holding the lock (hundreds of stress cycles). The node also came up after `kill -9`,
+restart, kubelet/containerd restarts, a reboot or a hard crash during the hold. Known failures: Flannel later
+than the limit, or repeated `systemctl stop` under extreme lock contention, with many hostPort pods.
 
 ## Install
 
@@ -59,7 +93,7 @@ caused 100-600 failed CNI teardowns per boot.
 install -m 0755 flannel-startup-hold /usr/local/sbin/flannel-startup-hold
 install -m 0644 flannel-startup-hold.service /etc/systemd/system/flannel-startup-hold.service
 systemctl daemon-reload
-systemctl enable flannel-startup-hold.service   # runs once per boot, after kubelet
+systemctl enable flannel-startup-hold.service   # starts before kubelet on every boot
 ```
 
 Logs: `journalctl -t kube-flannel-startup`.

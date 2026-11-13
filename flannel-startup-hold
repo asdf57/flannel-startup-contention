@@ -1,63 +1,279 @@
 #!/usr/bin/env bash
-# flannel-startup-hold: keep kube-proxy off the xtables lock until Flannel has written its rules.
+# flannel-startup-hold: after a reboot, let Flannel program its iptables rules before anything else uses iptables.
 #
-# On iptables-legacy nodes with many Services, kube-proxy's first full restore can land before Flannel programs its
-# few rules; every Flannel command then rewrites a huge NAT table behind a long lock queue. This briefly freezes
-# kube-proxy's cgroup (at most MAX_HOLD_SECONDS, never while one of its iptables commands runs) until Flannel writes
-# /run/flannel/subnet.env, then thaws it. It kills nothing.
+# On iptables-legacy nodes every iptables command rewrites a whole table under one global lock (/run/xtables.lock),
+# so its cost grows with the table. Once kube-proxy has loaded tens of thousands of Service rules, Flannel's few
+# commands are slow and queue behind kube-proxy and CNI (portmap) commands. Until Flannel has written
+# /run/flannel/subnet.env (it writes it after its rules are in), or MAX_SECONDS have passed, this script:
+#   - freezes kube-proxy from the moment it starts, and
+#   - puts a gate in front of the CNI portmap plugin, the only CNI plugin here that runs iptables.
+# Then it removes the gate, lets the pods' first CNI calls finish (seconds), and thaws kube-proxy. Everything is local
+# to this node and nothing is killed.
 #
-# Requires Flannel (and Multus, if used) to reach the API directly: set KUBERNETES_SERVICE_HOST/PORT to the API
-# endpoint on their DaemonSets. Otherwise Flannel needs kube-proxy's ClusterIP rule and holding kube-proxy stalls it.
-# Run after kubelet; the systemd unit calls it with --thaw on stop (ExecStopPost) so kube-proxy can never stay frozen.
+# The xtables lock can never be left stuck: kube-proxy is frozen only while this script holds the lock itself (so no
+# kube-proxy process can own it), and the lock is released only after the kernel reports every process FROZEN (so
+# none can take it later). If that cannot be confirmed, kube-proxy is thawed again.
+#
+# kube-proxy can never stay frozen and the gate can never stay up: besides this script's own release (Flannel ready,
+# time over, any exit) and the unit's ExecStopPost, a one-shot systemd timer is armed before anything is frozen or
+# mounted and runs "--thaw" when the time is over, whatever has happened to this process (even kill -9). Starting,
+# stopping or killing the service at any moment is harmless: a stop releases everything, and a later start in the
+# same boot takes the hold up again until the same moment the first start set (never longer). Run by hand, outside
+# its systemd unit, the script holds nothing ("--thaw" always works).
+#
+# The portmap gate writes nothing to disk. It is a small shell stub, kept in a tmpfs under /run (memory) and
+# bind-mounted read-only over /opt/cni/bin/portmap; the real plugin stays untouched underneath, and the stub runs a
+# byte-identical copy of it kept in the same tmpfs. Mounts and /run do not survive a reboot, so whatever happens to
+# this script, a reboot leaves the node's files exactly as they were.
+#   - While closed the stub answers DEL with success (after a reboot no hostPort rule exists until a portmap ADD
+#     has run, and ADD cannot run before Flannel is ready) and ADD with "try again later".
+#   - It runs the real plugin as soon as Flannel's subnet file exists or the node has been up past a fixed time,
+#     checked by the stub itself, so it opens even if this script is gone.
+#   - Before the stub is mounted, and again through the mounted path, the script runs it (5 s limit per call) and
+#     compares its answers with the real plugin's; if anything differs or hangs the gate is removed at once. With
+#     the unit's ExecStartPre this happens before kubelet starts, so a bad stub can never meet a real CNI call.
+#
+# Requires cgroup v1 (freezer controller). Works with or without KUBERNETES_SERVICE_HOST/PORT on Flannel's
+# DaemonSet: if Flannel reaches the API directly, kube-proxy is held from the moment it starts (Flannel's rules go
+# into a near-empty table); if Flannel uses the kubernetes Service IP, kube-proxy first runs until that IP answers
+# (its first sync), and is held after that (Flannel's rules go into the full table, but nothing competes).
+# The systemd unit starts it before kubelet (ExecStartPre --hold-cni) and calls it with --thaw on stop (ExecStopPost).
 
 set -u
 
-readonly READY=/run/flannel/subnet.env     # written by Flannel once its rules are in place
-readonly MAX_HOLD_SECONDS=120              # never keep kube-proxy frozen longer than this
-readonly DEADLINE_SECONDS=600              # give up waiting for Flannel after this
-readonly DONE_MARKER=/run/flannel-startup-hold.done
+readonly READY=/run/flannel/subnet.env     # written by Flannel after its rules are in place
+# Stop holding this long after the first start of this boot, Flannel ready or not (the gate then opens: fail open).
+# Change it with FLANNEL_HOLD_MAX_SECONDS in the unit's Environment=; keep the unit's RuntimeMaxSec above it.
+MAX_SECONDS=${FLANNEL_HOLD_MAX_SECONDS:-600}
+[[ $MAX_SECONDS =~ ^[1-9][0-9]*$ ]] || MAX_SECONDS=600
+readonly MAX_SECONDS
+readonly XT_LOCK=/run/xtables.lock
+readonly FREEZER=/sys/fs/cgroup/freezer
+readonly DEADLINE_FILE=/run/flannel-startup-hold.deadline   # in memory: gone after a reboot
+readonly PORTMAP=/opt/cni/bin/portmap
+readonly HOLD_DIR=/run/flannel-startup-hold       # a tmpfs mounted by this script: memory only
+readonly PORTMAP_REAL=$HOLD_DIR/portmap.real      # a byte-identical copy of the real plugin, for the stub to run
+readonly PORTMAP_GATE=$HOLD_DIR/portmap.gate      # the stub that is bind-mounted over $PORTMAP
 
-log() { logger -t kube-flannel-startup "$*"; }
+readonly SELF=$(readlink -f "$0")
+readonly SELF_COPY=/run/flannel-startup-hold.sh   # this script, in memory, for the release timer
 
-if [[ -f /sys/fs/cgroup/cgroup.controllers ]]; then FZ_FILE=cgroup.freeze FZ_ON=1 FZ_OFF=0
-else FZ_FILE=freezer.state FZ_ON=FROZEN FZ_OFF=THAWED; fi
+# Never let logging block the loop that has to thaw kube-proxy.
+log() { timeout 2 logger -t kube-flannel-startup "$*" 2>/dev/null; return 0; }
 
-cgroup_of() {
-    awk -F: -v f="$FZ_FILE" '(f == "cgroup.freeze" && $1 == 0) { print "/sys/fs/cgroup" $3 }
-        (f == "freezer.state" && $2 ~ /(^|,)freezer(,|$)/) { print "/sys/fs/cgroup/freezer" $3 }' "/proc/$1/cgroup"
+# NOW = uptime, ELAPSED = seconds since this script started; from the monotonic uptime clock (the wall clock can
+# jump when NTP syncs at boot).
+read -r START _ < /proc/uptime; readonly START=${START%.*}
+elapsed() { local up; read -r up _ < /proc/uptime; NOW=${up%.*}; ELAPSED=$(( NOW - START )); }
+
+# The freezer cgroup of every running kube-proxy.
+kube_proxy_cgroups() {
+    local pid
+    for pid in $(pgrep -x kube-proxy); do
+        awk -F: -v root="$FREEZER" '$2 ~ /(^|,)freezer(,|$)/ { print root $3 }' "/proc/$pid/cgroup" 2>/dev/null
+    done | sort -u
 }
 
-thaw_kube_proxy() {
-    local pid
-    for pid in $(pgrep -x kube-proxy); do echo "$FZ_OFF" > "$(cgroup_of "$pid")/$FZ_FILE" 2>/dev/null; done
+thaw() {
+    local cg
+    for cg in $(kube_proxy_cgroups); do echo THAWED > "$cg/freezer.state"; done 2>/dev/null
     return 0
 }
 
-# ExecStopPost: only thaw.
-if [[ "${1:-}" == --thaw ]]; then thaw_kube_proxy; exit 0; fi
+# Freeze cgroup $1 under the xtables lock. Returns 0 only when the kernel reports it FROZEN; 1 if there was nothing to
+# do (lock not obtained in the time left, the time is over, or Flannel became ready meanwhile - unless $2 is
+# "settle"); 2 if the freeze could not be confirmed (thawed again). Waiters get the lock in turn, so the wait is as
+# long as the queue ahead. Nothing is ever frozen after DEADLINE: the release timer runs only once, 30 s after it.
+freeze() {
+    local cg=$1 settling=${2:-} left
+    elapsed; left=$(( DEADLINE - NOW ))
+    (( left > 0 )) || return 1
+    (
+        flock -w "$left" 9 || exit 1
+        elapsed; (( NOW < DEADLINE )) || exit 1
+        [[ -n $settling || ! -s $READY ]] || exit 1
+        echo FROZEN > "$cg/freezer.state" || exit 2
+        for _ in {1..20}; do
+            [[ $(< "$cg/freezer.state") == FROZEN ]] && exit 0
+            sleep 0.05
+        done
+        echo THAWED > "$cg/freezer.state"
+        exit 2
+    ) 9< "$XT_LOCK" 2>/dev/null
+}
 
-# Once per boot.
-( set -o noclobber; : > "$DONE_MARKER" ) 2>/dev/null || exit 0
+# Dead man's switch: systemd runs "$SELF --thaw" 30 s after the hold must be over, whatever happens to this process.
+# Nothing is frozen or mounted unless this succeeded. The time is given as uptime (--on-boot): a timer counted from
+# its own start is pushed back by every "systemctl daemon-reload". It runs a copy of this script kept in memory, so
+# it works even if the script on disk is removed meanwhile.
+arm_release() {
+    cp -f "$SELF" "$SELF_COPY" && systemd-run --quiet --unit="flannel-startup-hold-release-$$-$RANDOM" \
+        --on-boot=$(( DEADLINE + 30 )) --timer-property=AccuracySec=1s "$BASH" "$SELF_COPY" --thaw > /dev/null 2>&1
+}
 
-trap 'thaw_kube_proxy' EXIT
-trap 'exit 0' TERM INT
+cni_held() { mountpoint -q "$PORTMAP"; }
 
-held_at=0
-while (( SECONDS < DEADLINE_SECONDS )) && [[ ! -s "$READY" ]]; do
-    if (( held_at == 0 )) && pid=$(pgrep -xo kube-proxy); then
-        cg=$(cgroup_of "$pid")
-        echo "$FZ_ON" > "$cg/$FZ_FILE" 2>/dev/null || { log "cannot freeze kube-proxy ($cg); not holding"; break; }
-        # Never leave kube-proxy frozen while one of its iptables commands holds the lock.
-        if xargs -r -a "$cg/cgroup.procs" ps -o comm= -p 2>/dev/null | grep -q '^ip6\?tables'; then
-            echo "$FZ_OFF" > "$cg/$FZ_FILE"; sleep 0.5; continue
-        fi
-        held_at=$SECONDS
-        log "kube-proxy held at ${SECONDS}s until Flannel is ready (max ${MAX_HOLD_SECONDS}s)"
-    fi
-    (( held_at > 0 && SECONDS - held_at >= MAX_HOLD_SECONDS )) && break
-    sleep 0.2
+# Remove the gate: unmount the stub (the path is the real plugin again), give a stub that is just running the
+# moment to hand over to the real plugin, then drop the rest. Safe to call when nothing is mounted.
+release_cni() {
+    while mountpoint -q "$PORTMAP"; do umount "$PORTMAP" 2>/dev/null || umount -l "$PORTMAP" || break; done
+    mountpoint -q "$HOLD_DIR" || return 0
+    sleep 0.5
+    while mountpoint -q "$HOLD_DIR"; do umount "$HOLD_DIR" 2>/dev/null || umount -l "$HOLD_DIR" || break; done
+    rmdir "$HOLD_DIR" 2>/dev/null
+    return 0
+}
+
+# Does the stub, run as "$@", answer as it must (each call may take 5 s at most)? VERSION: the real plugin's answer
+# ($1 of this function is that answer). While Flannel is not ready also: DEL succeeds silently, ADD fails with
+# "try again later".
+gate_answers() {
+    local want=$1 out; shift
+    [[ $(CNI_COMMAND=VERSION timeout 5 "$@" < /dev/null 2>/dev/null) == "$want" ]] || return 1
+    [[ -s $READY ]] && return 0
+    out=$(CNI_COMMAND=DEL timeout 5 "$@" < /dev/null 2>&1) && [[ -z $out ]] || return 1
+    out=$(CNI_COMMAND=ADD timeout 5 "$@" < /dev/null 2>&1); [[ $? == 1 && $out == *'"code": 11'* ]]
+}
+
+# Put the gate in front of portmap. It opens by itself once $READY exists or uptime reaches $DEADLINE.
+hold_cni() {
+    local open_at=$DEADLINE want
+    cni_held && return 0
+    want=$(CNI_COMMAND=VERSION timeout 5 "$PORTMAP" < /dev/null 2>/dev/null) && [[ $want == *supportedVersions* ]] ||
+        { log "no working $PORTMAP; CNI portmap is not gated"; return 0; }
+    release_cni   # nothing half-built from an earlier run
+    arm_release || { log "cannot arm the release timer; CNI portmap is not gated"; return 0; }
+    if mkdir -p "$HOLD_DIR" && mount -t tmpfs -o size=64m,mode=0755 tmpfs "$HOLD_DIR" &&
+        cp "$PORTMAP" "$PORTMAP_REAL" && chmod 0755 "$PORTMAP_REAL" && cmp -s "$PORTMAP" "$PORTMAP_REAL" &&
+        cat > "$PORTMAP_GATE" <<GATE &&
+#!/bin/sh
+# flannel-startup-hold portmap gate: mounted over $PORTMAP at boot, unmounted when Flannel is ready.
+# Runs the real plugin once Flannel has written its subnet file or the node has been up $open_at s.
+read -r up _ < /proc/uptime
+if [ -s $READY ] || [ "\${up%.*}" -ge $open_at ] || [ "\$CNI_COMMAND" = VERSION ]; then
+    # Never run itself: the real plugin is started at most once per call.
+    if [ -n "\$FLANNEL_STARTUP_HOLD_GATE" ]; then echo '{"code": 11, "msg": "portmap gate ran itself; try again later"}'; exit 1; fi
+    export FLANNEL_STARTUP_HOLD_GATE=1
+    exec $PORTMAP_REAL "\$@"
+fi
+[ "\$CNI_COMMAND" = DEL ] && exit 0
+echo '{"code": 11, "msg": "Flannel is not ready yet; try again later"}'
+exit 1
+GATE
+        chmod 0755 "$PORTMAP_GATE" && gate_answers "$want" "$PORTMAP_GATE" &&
+        mount --bind "$PORTMAP_GATE" "$PORTMAP" && mount -o remount,bind,ro "$PORTMAP" && gate_answers "$want" "$PORTMAP"
+    then return 0
+    else log "the portmap gate did not pass its checks; removed it, CNI portmap is not gated"; release_cni; fi
+}
+
+release() { thaw; release_cni; }
+
+# Once Flannel is ready the pods' waiting CNI calls all run within seconds (kubelet retries a failed pod about
+# every 10 s). Their portmap commands are cheap on the still-small table and very slow once kube-proxy has loaded
+# its rules (with many hostPort pods they then time out and never finish), so kube-proxy stays held a little
+# longer: until no portmap has run for 20 s (longer than kubelet's retry pause or a short runtime hiccup), at most
+# 60 s. A kube-proxy that only starts in this time is held too. Ends at DEADLINE at the latest.
+settle() {
+    local t0 quiet=0
+    elapsed; t0=$ELAPSED
+    while (( NOW < DEADLINE && ELAPSED - t0 < 60 && quiet < 100 )); do
+        hold_kube_proxy settle
+        if pgrep -x portmap > /dev/null; then quiet=0; else quiet=$(( quiet + 1 )); fi
+        sleep 0.2; elapsed
+    done
+}
+
+# KUBERNETES_SERVICE_HOST in the environment of the oldest process named $1.
+api_host_of() {
+    local pid
+    pid=$(pgrep -xo "$1") && tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null | sed -n 's/^KUBERNETES_SERVICE_HOST=//p'
+}
+
+# True while Flannel still needs kube-proxy to run: flanneld reaches the API through the Service IP that kubelet
+# injects (the value kube-proxy has too), and that IP does not answer yet because kube-proxy has not programmed it.
+flannel_waits_for_kube_proxy() {
+    local flannel proxy
+    (( service_ip_works )) && return 1
+    flannel=$(api_host_of flanneld) && proxy=$(api_host_of kube-proxy) && [[ -n $flannel && $flannel == "$proxy" ]] || return 1
+    timeout 2 bash -c "exec 3<> /dev/tcp/$flannel/443" 2>/dev/null && { service_ip_works=1; return 1; }
+    return 0
+}
+
+# ExecStopPost: only thaw and remove the gate.
+if [[ "${1:-}" == --thaw ]]; then release; exit 0; fi
+
+# Hold only as a systemd service: then the unit's ExecStopPost releases at once however this process ends. Started
+# any other way (by hand), nothing would do that before the release timer.
+[[ -n ${INVOCATION_ID:-} ]] || { echo "start it with: systemctl start ${0##*/}.service" >&2; exit 0; }
+
+# With a tool missing the script could start something it cannot undo: do nothing instead.
+for tool in flock pgrep awk timeout mount umount mountpoint cmp; do
+    command -v "$tool" > /dev/null || { log "$tool is missing; not holding kube-proxy or CNI portmap"; exit 0; }
 done
 
-thaw_kube_proxy
-if [[ -s "$READY" ]]; then log "Flannel ready after ${SECONDS}s; kube-proxy released"
-else log "Flannel not ready after ${SECONDS}s; kube-proxy released"; fi
+# The hold ends at a fixed uptime, set by the first start of this boot and kept in memory. A later start in the same
+# boot (the service was stopped, killed or restarted) takes the hold up again until that same moment; a start after
+# it, or with Flannel ready, does nothing.
+DEADLINE=$(cat "$DEADLINE_FILE" 2>/dev/null)
+[[ $DEADLINE =~ ^[0-9]+$ ]] && (( DEADLINE <= START + MAX_SECONDS )) ||
+    { DEADLINE=$(( START + MAX_SECONDS )); echo "$DEADLINE" > "$DEADLINE_FILE"; } 2>/dev/null
+[[ ! -s $READY ]] && (( START < DEADLINE )) || exit 0
+
+# ExecStartPre (before kubelet starts): only put the gate up, so it is there - and checked - before the first CNI call.
+if [[ "${1:-}" == --hold-cni ]]; then hold_cni; exit 0; fi
+
+# One instance at a time.
+exec 8>> "$DEADLINE_FILE" && flock -w 3 8 || exit 0
+
+trap release EXIT
+trap 'exit 0' TERM INT
+
+hold_cni
+
+# Stop holding kube-proxy for the rest of this run (the portmap gate stays until Flannel is ready).
+hold=1
+no_hold() { log "$1; not holding kube-proxy"; thaw; hold=0; }
+[[ -d $FREEZER ]] || no_hold "no cgroup v1 freezer at $FREEZER"
+(( hold )) && { arm_release || no_hold "cannot arm the release timer"; }
+
+# One pass: freeze every running kube-proxy that is not frozen yet ($1 = settle: also when Flannel is ready).
+unconfirmed=0
+hold_kube_proxy() {
+    local cg pid
+    for cg in $( (( hold )) && kube_proxy_cgroups ); do
+        [[ $(< "$cg/freezer.state") == FROZEN ]] && continue
+        pid=$(head -n 1 "$cg/cgroup.procs") && [[ -d /proc/$pid/root/ ]] || continue   # container just exited
+        # Freeze a pod container's own cgroup only, never one that other processes of the node share.
+        [[ $cg == */kubepods* ]] || { no_hold "kube-proxy is not in a pod cgroup ($cg)"; break; }
+        # The guarantee needs kube-proxy to use the same lock file as this script.
+        if ! [[ "/proc/$pid/root$XT_LOCK" -ef "$XT_LOCK" ]]; then
+            no_hold "kube-proxy does not share $XT_LOCK with the host"; break
+        fi
+        freeze "$cg" "${1:-}"
+        case $? in
+            0) elapsed; log "kube-proxy held at ${ELAPSED}s (at most until uptime ${DEADLINE}s)" ;;
+            2) (( ++unconfirmed < 3 )) || { no_hold "cannot confirm kube-proxy frozen"; break; } ;;
+        esac
+    done
+}
+
+service_ip_works=0 told=0
+elapsed
+while [[ ! -s $READY ]] && (( NOW < DEADLINE )); do
+    if (( hold )) && flannel_waits_for_kube_proxy; then
+        (( told++ )) || log "Flannel reaches the API through the Service IP; kube-proxy runs until that IP answers, then is held"
+        thaw; sleep 0.2; elapsed; continue
+    fi
+    hold_kube_proxy
+    sleep 0.2
+    elapsed
+done
+
+elapsed
+if [[ -s $READY ]]; then
+    log "Flannel ready after ${ELAPSED}s; portmap released, kube-proxy follows when the first CNI calls are done"
+    release_cni; (( hold )) && settle
+    release; elapsed; log "kube-proxy released after ${ELAPSED}s"
+else
+    release; log "Flannel not ready after ${ELAPSED}s; kube-proxy and portmap released"
+fi

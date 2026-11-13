@@ -1,15 +1,22 @@
 [Unit]
-Description=Keep kube-proxy off the xtables lock until Flannel is ready
-After=kubelet.service
-Wants=kubelet.service
+Description=Let Flannel program iptables before kube-proxy and CNI portmap
+Before=kubelet.service
 
 [Service]
 Type=simple
+# The portmap gate is up, and checked, before kubelet starts, so before the first CNI call.
+# "-": if this step fails the script still runs. TimeoutStartSec: kubelet waits for this step at most that long.
+ExecStartPre=-/usr/local/sbin/flannel-startup-hold --hold-cni
+TimeoutStartSec=60
 ExecStart=/usr/local/sbin/flannel-startup-hold
-# Runs even if the script is killed, so kube-proxy can never stay frozen.
+# Runs however the script ends (even killed): thaws kube-proxy and removes the gate.
 ExecStopPost=/usr/local/sbin/flannel-startup-hold --thaw
-# Above the script's own 600 s deadline; if anything hangs, systemd stops it and ExecStopPost thaws kube-proxy.
-RuntimeMaxSec=900
+# How long to wait for Flannel before letting everything go (default 600 s).
+#Environment=FLANNEL_HOLD_MAX_SECONDS=600
+# Must stay above that limit: if the script hangs or is stopped, systemd ends it then and ExecStopPost cleans up.
+RuntimeMaxSec=720
+# Killed or crashed: start again at once and take the hold up again (a "systemctl stop" is not restarted).
+Restart=on-failure
 
 [Install]
 WantedBy=multi-user.target
